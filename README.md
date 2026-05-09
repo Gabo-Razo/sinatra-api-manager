@@ -1,29 +1,39 @@
-# Sinatra API Manager
+# GR API Manager
 
-A minimal, opinionated Ruby wrapper around Sinatra that eliminates boilerplate from REST API development. Authentication, parameter validation, type casting, CORS, and error handling are handled at the framework level — you write only business logic.
+[![Gem Version](https://badge.fury.io/rb/gr-api-manager.svg)](https://rubygems.org/gems/gr-api-manager)
+
+A minimal, opinionated Ruby wrapper around Sinatra that eliminates boilerplate from REST API development. Authentication, parameter validation, type casting, CORS, and error handling are handled at the framework level — you write only the business logic.
 
 ---
 
 ## Features
 
-- Route-level Bearer Token authentication (opt-in/opt-out per endpoint)
-- Declarative required parameter validation with automatic 400 responses
-- Smart type casting for query string values (`"10"` → `Integer`, `"true"` → `TrueClass`, `"9.5"` → `Float`)
-- Global JSON error responses for 404 and 500
-- CORS and OPTIONS preflight handling out of the box
-- API versioning via configurable route prefix (e.g. `/api/v1`)
-- Automatic JSON serialization of all responses
+- **Available on RubyGems!** Install globally and use it in any project.
+- Route-level Bearer Token authentication (opt-in/opt-out per endpoint).
+- Declarative required parameter validation with automatic `400 Bad Request` responses.
+- Smart type casting for query string values (`"10"` -> `Integer`, `"true"` -> `TrueClass`, `"9.5"` -> `Float`).
+- Global JSON error responses for `404` and `500`.
+- Broad CORS and `OPTIONS` preflight handling out of the box (Frontend ready).
+- API versioning via configurable route prefix (e.g. `/api/v1`).
 
 ---
 
-## Requirements
+## Installation
 
-- Ruby 3.x
-- `sinatra`
-- `dotenv`
+Add this line to your application's Gemfile:
 
+```ruby
+gem 'gr-api-manager'
+```
+
+And then execute:
 ```bash
-gem install sinatra dotenv
+bundle install
+```
+
+Or install it yourself directly via RubyGems:
+```bash
+gem install gr-api-manager
 ```
 
 ---
@@ -31,14 +41,15 @@ gem install sinatra dotenv
 ## Quick Start
 
 ```ruby
-require_relative 'api'
+require 'gr_api_manager'
 
-api = ApiManager::NewApi.new(
+api = GRApiManager::Server.new(
   port: 4567,
   bearer_token: "your_secret_token",
   prefix: "/api/v1"
 )
 
+# Public endpoint
 api.get('/health', auth: false) do
   { status: 'online', time: Time.now.to_s }
 end
@@ -58,7 +69,7 @@ curl http://localhost:4567/api/v1/health
 All parameters are optional. If omitted, the manager falls back to environment variables loaded from a `.env` file at the project root (via `dotenv`). If neither is provided, defaults are used.
 
 ```ruby
-ApiManager::NewApi.new(
+GRApiManager::Server.new(
   port: 4567,                        # Default: ENV['PORT'] || 4000
   bearer_token: "secret",            # Default: ENV['API_TOKEN']
   permitted_hosts: ["example.com"],  # Host allowlist — empty means allow all
@@ -66,7 +77,7 @@ ApiManager::NewApi.new(
 )
 ```
 
-### Using a .env file
+### Using a .env file (Recommended)
 
 Create a `.env` file at the root of your project:
 
@@ -78,13 +89,15 @@ API_TOKEN=your_secret_token
 Then initialize the manager with no arguments and it will pick everything up automatically:
 
 ```ruby
-api = ApiManager::NewApi.new
+require 'gr_api_manager'
+
+api = GRApiManager::Server.new
 # Reads PORT and API_TOKEN from .env
 ```
 
 This is the recommended approach for production — keep secrets out of source code and out of version control. Add `.env` to your `.gitignore`.
 
-```
+```text
 # .gitignore
 .env
 ```
@@ -93,7 +106,7 @@ This is the recommended approach for production — keep secrets out of source c
 
 When a value is provided both in code and in `.env`, the explicit argument always wins:
 
-```
+```text
 new(bearer_token: "hardcoded")  >  ENV['API_TOKEN']  >  nil (auth disabled)
 new(port: 4567)                 >  ENV['PORT']        >  4000
 ```
@@ -105,9 +118,12 @@ new(port: 4567)                 >  ENV['PORT']        >  4000
 The manager exposes `get`, `post`, `put`, and `delete` methods. Each route receives a merged `params` hash containing both URL/query parameters (type-cast) and the parsed JSON body.
 
 ```ruby
-api.get('/path', auth: true, requires: [:param1, :param2]) do |params|
+api.get('/users', auth: true, requires: [:role, :age]) do |params|
   # params is a merged, type-cast hash of all inputs
-  { result: params[:param1] }
+  { 
+    requested_role: params[:role],
+    is_adult: params[:age] >= 18 # age is safely cast to Integer
+  }
 end
 ```
 
@@ -136,26 +152,26 @@ api.get('/health', auth: false) do
 end
 ```
 
-Error responses:
+**Automatic Error Responses:**
 
 ```json
-// Missing header
-{ "error": "Token requerido. Formato: 'Bearer <token>'" }  // 401
+// Missing header (401)
+{ "error": "Token required. Format: 'Bearer <token>'" }
 
-// Wrong token
-{ "error": "Token inválido" }  // 403
+// Wrong token (403)
+{ "error": "Invalid token" }
 ```
 
 ---
 
 ## Parameter Validation
 
-Declare required parameters at the route level. If any are missing or blank, the framework responds with `400` automatically — no conditional logic needed in your handler.
+Declare required parameters at the route level. If any are missing or blank, the framework responds with `400 Bad Request` automatically — no conditional logic needed in your handler.
 
 ```ruby
-api.post('/users', requires: [:name, :role]) do |params|
+api.post('/users', requires: [:name, :email]) do |params|
   status 201
-  { message: "Created", user: params }
+  { message: "User created", user: params }
 end
 ```
 
@@ -165,7 +181,7 @@ curl -X POST http://localhost:4567/api/v1/users \
   -H "Content-Type: application/json" \
   -d '{"name": "Gabo"}'
 
-# => 400 { "error": "Faltan parámetros obligatorios", "required": ["role"] }
+# => 400 { "error": "Missing required parameters", "required": ["email"] }
 ```
 
 ---
@@ -197,10 +213,10 @@ Global handlers return consistent JSON for unmatched routes and unhandled except
 
 ```json
 // 404
-{ "error": "Endpoint no encontrado", "path": "/api/v1/missing" }
+{ "error": "Endpoint not found", "path": "/api/v1/missing" }
 
 // 500
-{ "error": "Error interno del servidor", "details": "..." }
+{ "error": "Internal Server Error", "details": "..." }
 ```
 
 You can also set status codes and short-circuit responses manually inside any handler:
@@ -209,7 +225,7 @@ You can also set status codes and short-circuit responses manually inside any ha
 api.get('/users/:id') do |params|
   if params[:id] == 0
     status 404
-    next { error: "ID de usuario no válido" }
+    next { error: "Invalid user ID" }
   end
 
   { id: params[:id], name: "User_#{params[:id]}" }
@@ -222,7 +238,7 @@ end
 
 Every request is logged to stdout with a timestamp and color-coded status:
 
-```
+```text
 [14:32:01] GET /api/v1/health - 200
 [14:32:05] POST /api/v1/users - 400
 ```
@@ -237,25 +253,13 @@ Green for 2xx, red for everything else.
 api.run!
 ```
 
-```
+```text
 =============================================
-API MANAGER INICIADO
-Puerto : 4567
-Auth   : Requerida por defecto
-Prefix : /api/v1
+  GR API MANAGER STARTED
+  Port   : 4567
+  Auth   : Enabled
+  Prefix : /api/v1
 =============================================
-```
-
----
-
-## Project Structure
-
-```
-sinatra_manager/
-├── api.rb        # Core framework — ApiManager::NewApi
-├── ejemplos.rb   # Usage examples and test routes
-├── .env          # PORT and API_TOKEN (not committed)
-└── README.md
 ```
 
 ---
@@ -265,20 +269,20 @@ sinatra_manager/
 Below is a complete working API covering the most common patterns.
 
 ```ruby
-require_relative 'api'
+require 'gr_api_manager'
 
-api = ApiManager::NewApi.new(
+api = GRApiManager::Server.new(
   port: 4567,
   bearer_token: "secret123",
   prefix: "/api/v1"
 )
 
-# Public health check — no token required
+# 1. Public health check — no token required
 api.get('/health', auth: false) do
   { status: 'online', time: Time.now.strftime("%Y-%m-%d %H:%M:%S") }
 end
 
-# List users — token required (default)
+# 2. List users — token required (default)
 api.get('/users') do |params|
   users = [
     { id: 1, name: "Alice", role: "admin" },
@@ -287,7 +291,7 @@ api.get('/users') do |params|
   { users: users, total: users.length }
 end
 
-# Get single user by ID — :id is cast to Integer automatically
+# 3. Get single user by ID — :id is cast to Integer automatically
 api.get('/users/:id') do |params|
   if params[:id] == 0
     status 404
@@ -296,70 +300,23 @@ api.get('/users/:id') do |params|
   { id: params[:id], name: "User_#{params[:id]}" }
 end
 
-# Create user — validates required fields before reaching the block
+# 4. Create user — validates required fields before reaching the block
 api.post('/users', requires: [:name, :role]) do |params|
   status 201
   { message: "User created", user: { name: params[:name], role: params[:role] } }
 end
 
-# Update user
+# 5. Update user
 api.put('/users/:id', requires: [:name]) do |params|
   { message: "User #{params[:id]} updated", name: params[:name] }
 end
 
-# Delete user
+# 6. Delete user
 api.delete('/users/:id') do |params|
   { message: "User #{params[:id]} deleted" }
 end
 
 api.run!
-```
-
-### Calling the API
-
-```bash
-# Health check (no auth)
-curl http://localhost:4567/api/v1/health
-
-# List users
-curl http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer secret123"
-
-# Get user by ID
-curl http://localhost:4567/api/v1/users/42 \
-  -H "Authorization: Bearer secret123"
-
-# Create user
-curl -X POST http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer secret123" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Gabo", "role": "admin"}'
-
-# Create user — missing 'role' triggers automatic 400
-curl -X POST http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer secret123" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Gabo"}'
-# => {"error":"Faltan parámetros obligatorios","required":["role"]}
-
-# Update user
-curl -X PUT http://localhost:4567/api/v1/users/42 \
-  -H "Authorization: Bearer secret123" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Gabo Updated"}'
-
-# Delete user
-curl -X DELETE http://localhost:4567/api/v1/users/42 \
-  -H "Authorization: Bearer secret123"
-
-# Wrong token — returns 403
-curl http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer wrongtoken"
-# => {"error":"Token inválido"}
-
-# Missing token — returns 401
-curl http://localhost:4567/api/v1/users
-# => {"error":"Token requerido. Formato: 'Bearer <token>'"}
 ```
 
 ### Minimal setup using only .env
@@ -372,9 +329,9 @@ API_TOKEN=secret123
 
 ```ruby
 # api_server.rb
-require_relative 'api'
+require 'gr_api_manager'
 
-api = ApiManager::NewApi.new  # reads everything from .env
+api = GRApiManager::Server.new  # reads everything from .env
 
 api.get('/ping', auth: false) { { pong: true } }
 
@@ -385,4 +342,4 @@ api.run!
 
 ## License
 
-MIT
+The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
