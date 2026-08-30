@@ -1,827 +1,614 @@
 # GR API Manager
 
-[![Gem Version](https://badge.fury.io/rb/gr-api-manager.svg)](https://rubygems.org/gems/gr-api-manager)
-[![README en Español](https://img.shields.io/badge/README-Español-blue)](README_ES.md)
+[![Gem Version](https://img.shields.io/gem/v/gr_api_manager.svg?logo=rubygems&logoColor=white&color=e9573f)](https://rubygems.org/gems/gr_api_manager)
+[![Gem Total Downloads](https://img.shields.io/gem/dt/gr_api_manager.svg?logo=rubygems&logoColor=white&color=00bfa5)](https://rubygems.org/gems/gr_api_manager)
+[![Ruby Version](https://img.shields.io/badge/Ruby-%3E%3D%203.0-cc342d.svg?logo=ruby&logoColor=white)](https://www.ruby-lang.org/)
+[![Sinatra Version](https://img.shields.io/badge/Sinatra-%3E%3D%203.0-008080.svg?logo=sinatra&logoColor=white)](https://sinatrarb.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-007ec6.svg?logo=open-source-initiative&logoColor=white)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-555555.svg?logo=linux&logoColor=white)](https://rubygems.org/gems/gr_api_manager)
+[![Tests](https://img.shields.io/badge/Tests-59%2F59%20Passing-4c1.svg?logo=checkmarx&logoColor=white)](spec/)
+[![README en Español](https://img.shields.io/badge/README-Espa%C3%B1ol-red.svg?logo=google-translate&logoColor=white)](README_ES.md)
 
-A minimal Ruby wrapper around Sinatra that eliminates boilerplate from REST API development. Auth, parameter validation, type casting, CORS, error handling, **file uploads, raw binaries, images, Base64 and hexadecimal** — all at the framework level. You write only the business logic.
+**GR API Manager** is a minimalist, high-performance Ruby wrapper on top of Sinatra and Puma, designed to build production-grade REST APIs with zero boilerplate.
 
 ---
 
-## Features
+## System Requirements
 
-- Available on **RubyGems** — install globally, use anywhere.
-- Route-level Bearer Token auth (on/off per endpoint).
-- Declarative required parameter validation → automatic `400 Bad Request`.
-- Smart type casting: `"10"` → `Integer`, `"true"` → `TrueClass`, `"9.5"` → `Float`.
-- Global JSON error responses for `404`, `500`, and `413`.
-- Broad CORS and preflight `OPTIONS` out of the box.
-- API versioning via configurable route prefix (`/api/v1`, `/geo/v2`, etc.).
-- **Full binary & file support** — multipart, raw binary, Base64, hex, `text/plain`.
-- Configurable body size limit with `mb` / `gb` helpers.
-- **Dev mode** — full stack traces on `500` for easier debugging.
+| Dependency / Environment | Required / Supported Version |
+|---|---|
+| **Ruby** | `>= 3.0` (Tested on 3.0, 3.1, 3.2, 3.3, and 3.4) |
+| **Sinatra** | `>= 3.0, < 5.0` |
+| **Puma** | `>= 5.0, < 9.0` |
+| **Dotenv** | `>= 2.8, < 4.0` |
+
+---
+
+## Key Features
+
+- **Available on RubyGems (`0.4.0`)** - global installation or via Bundler.
+- **Modular Route Groups (`api.group`)** - organize large projects into clean, multi-file sub-routers with prefix & option inheritance.
+- **Dual Authentication (Static Bearer Token & Native JWT)** - support for pre-shared static tokens and zero-dependency built-in HMAC-SHA256 JWT engine.
+- **Declarative Schema & Type Validation** - validate complex request contracts with `:email`, `:url`, `:boolean`, `:file`, classes (`Integer`, `Float`, `String`, `Array`, `Hash`), enum lists, regular expressions, or custom procs.
+- **Sliding-Window Rate Limiting (429)** - sliding-window rate limiter with automatic client IP detection behind Cloudflare (`CF-Connecting-IP`), Nginx (`X-Real-IP`), or Reverse Proxies (`X-Forwarded-For`), supporting in-memory or pluggable stores (Redis).
+- **Smart Parameter Casting** - automatic type casting for query and URL parameters (`"100"` -> `100`, `"-42"` -> `-42`, `"true"` -> `true`, `"19.99"` -> `19.99`).
+- **Unified File & Binary Handling (`FilePayload`)** - transparent handling for multipart uploads, raw binary streams, Base64/Hex encoding, file serving/downloads, and disk storage with directory auto-creation.
+- **Puma Concurrency** - configurable multi-process workers and thread pools.
+- **Developer Mode (`dev_mode`)** - structured JSON error responses with full stack traces for painless debugging.
 
 ---
 
 ## Installation
 
+Add the gem to your `Gemfile`:
 ```ruby
-gem 'gr-api-manager'   # Gemfile
+gem 'gr_api_manager', '~> 0.4.0'
 ```
 
+And run:
 ```bash
 bundle install
-# or: gem install gr-api-manager
+```
+
+Or install directly:
+```bash
+gem install gr_api_manager
 ```
 
 ---
 
-## Quick Start — name it anything you want
+## Table of Contents
 
-The `Server` object is just a Ruby object. Call it `api`, `app`, `pais_api`, `backend`, `mi_servicio` — whatever fits your project. There is no magic name.
+1. [Quickstart](#quickstart)
+2. [Authentication: Static Bearer Token & Native JWT](#authentication-static-bearer-token--native-jwt)
+3. [Multi-File Modular Architecture (Importing & Grouping)](#multi-file-modular-architecture)
+4. [Full REST CRUD with HTTP Verbs](#full-rest-crud-with-http-verbs)
+5. [Declarative Schema & Type Validation](#declarative-schema--type-validation)
+6. [Comprehensive File, Binary & Image Handling](#comprehensive-file-binary--image-handling)
+7. [Serving & Downloading Files to Clients](#serving--downloading-files-to-clients)
+8. [Rate Limiting & Real IP Detection (Cloudflare/Nginx)](#rate-limiting--real-ip-detection)
+9. [Smart Parameter Casting](#smart-parameter-casting)
+10. [Responses, HTTP Status Codes & Dev Mode](#responses-http-status-codes--dev-mode)
+11. [Concurrency & Production Deployment (Puma & Docker)](#concurrency--production-deployment)
+
+---
+
+## Quickstart
+
+Create an `app.rb` file:
 
 ```ruby
 require 'gr_api_manager'
 
-# Any name works
-api      = GRApiManager::Server.new(port: 4567, bearer_token: "secret")
-pais_api = GRApiManager::Server.new(prefix: "/geo/v1")
-reports  = GRApiManager::Server.new(port: 5000, max_body_size: GRApiManager.gb(1))
+# Initialize the server with static token and JWT key
+api = GRApiManager::Server.new(
+  port: 4000,
+  bearer_token: "my_static_secret_token",
+  jwt_secret: "my_jwt_signing_secret"
+)
 
-api.get('/health', auth: false) { { status: 'ok' } }
+# Public endpoint (no auth required)
+api.get('/health', auth: false) do
+  { status: 'online', timestamp: Time.now.to_i }
+end
+
+# Protected endpoint with static token (default: auth = true)
+api.get('/protected-data') do
+  { message: "Access granted with Bearer Token", data: [10, 20, 30] }
+end
+
+# Start the server
 api.run!
 ```
 
+Run your API:
+```bash
+ruby app.rb
+```
+
 ---
 
-## Configuration
+## Authentication: Static Bearer Token & Native JWT
 
+`gr_api_manager` supports two complementary authentication schemes:
+
+### 1. Static Bearer Token
+
+Ideal for internal services, webhooks, microservices, or backend automation using a pre-shared static key.
+
+#### Configuration in `app.rb`:
 ```ruby
-GRApiManager::Server.new(
-  port:            4567,
-  bearer_token:    "secret",
-  permitted_hosts: ["example.com"],   # empty = allow all
-  prefix:          "/api/v1",
-  max_body_size:   GRApiManager.mb(50),  # default 50 MB
-  dev_mode:        false                 # default false
+api = GRApiManager::Server.new(
+  bearer_token: "my_secret_company_token_2026"
 )
-```
 
-### Size helpers
+# Public route
+api.get('/public', auth: false) do
+  { status: "open access" }
+end
 
-Express limits cleanly without doing manual math:
+# Protected routes (default auth: true)
+api.get('/admin/config') do
+  { database: "connected", environment: "production" }
+end
 
-```ruby
-GRApiManager.mb(50)    # 50 megabytes
-GRApiManager.mb(200)   # 200 megabytes — for large file uploads
-GRApiManager.gb(1)     # 1 gigabyte   — for heavy reports or video
-
-# Examples
-video_api  = GRApiManager::Server.new(max_body_size: GRApiManager.gb(2))
-json_api   = GRApiManager::Server.new(max_body_size: GRApiManager.mb(1))
-report_api = GRApiManager::Server.new(max_body_size: GRApiManager.mb(500))
-```
-
-### `.env` file (recommended for production)
-
-```env
-PORT=4567
-API_TOKEN=your_secret_token
-```
-
-```ruby
-api = GRApiManager::Server.new   # picks up PORT and API_TOKEN automatically
-```
-
-Explicit arguments always override `.env`. Add `.env` to `.gitignore`.
-
----
-
-## HTTP Verbs — what each one does
-
-| Method | Purpose | Typical use |
-|---|---|---|
-| `GET` | **Read** — fetch data, no side effects | List, search, get by ID |
-| `POST` | **Create** — add a new resource | Create user, upload file |
-| `PUT` | **Full replace** — replace an existing resource entirely | Update full user profile |
-| `PATCH` | **Partial update** — modify specific fields only | Change only an email |
-| `DELETE` | **Remove** — delete a resource | Delete user, remove file |
-
-```ruby
-api.get('/users')         { ... }   # list
-api.get('/users/:id')     { ... }   # read one
-api.post('/users')        { ... }   # create
-api.put('/users/:id')     { ... }   # full replace
-api.patch('/users/:id')   { ... }   # partial update
-api.delete('/users/:id')  { ... }   # delete
-```
-
----
-
-## Defining Routes
-
-```ruby
-api.post('/path', auth: true, requires: [:name, :email]) do |params|
-  # params — merged hash: URL segments + query string (type-cast) + parsed body
-  { result: "ok" }
+api.post('/admin/restart', requires: [:reason]) do |params|
+  { action: "restarting", reason: params[:reason] }
 end
 ```
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `auth` | Boolean | `true` | Require Bearer Token |
-| `requires` | Array | `[]` | Required parameter keys |
+#### Consuming via cURL:
+
+**Valid request (200 OK):**
+```bash
+curl -H "Authorization: Bearer my_secret_company_token_2026" http://localhost:4000/admin/config
+# => {"database":"connected","environment":"production"}
+```
+
+**Missing Authorization header (401 Unauthorized):**
+```bash
+curl http://localhost:4000/admin/config
+# => 401 {"error":"Token required. Format: 'Bearer <token>'"}
+```
+
+**Invalid token (403 Forbidden):**
+```bash
+curl -H "Authorization: Bearer wrong_token" http://localhost:4000/admin/config
+# => 403 {"error":"Invalid token"}
+```
 
 ---
 
-## Success Responses
+### 2. Native JWT Authentication (HS256)
 
-Return any Hash or Array — the framework serializes to JSON automatically.
+Ideal for end-user facing APIs issuing dynamic tokens with expiration and claims.
 
+#### Complete Workflow:
 ```ruby
-# Simple hash
-api.get('/ping', auth: false) { { pong: true } }
+api = GRApiManager::Server.new(
+  jwt_secret: "my_super_secret_jwt_key"
+)
 
-# Set a status code
-api.post('/users', requires: [:name]) do |params|
-  status 201
-  { message: "Created", user: { name: params[:name] } }
-end
-
-# Short-circuit with next
-api.get('/users/:id') do |params|
-  if params[:id] == 0
-    status 404
-    next { error: "Not found" }
+# 1. Login: issue and return token
+api.post('/auth/login', auth: false, requires: { email: :email, password: String }) do |params|
+  if params[:email] == "admin@company.com" && params[:password] == "pass123"
+    token = api.jwt_encode(
+      { user_id: 42, email: params[:email], role: "admin" },
+      exp: Time.now.to_i + 3600 # 1-hour expiration
+    )
+    { token: token, token_type: "Bearer", expires_in: 3600 }
+  else
+    status 401
+    { error: "Invalid credentials" }
   end
-  { id: params[:id], name: "Alice" }
 end
-```
 
-> Returning a `String` sends it **as-is** (no JSON wrapping) — useful for binary file responses.
-
----
-
-## Authentication
-
-```ruby
-api.get('/health', auth: false) { { status: 'online' } }  # public
-
-api.get('/data') do |params|    # protected (default)
-  { secret: "data" }
+# 2. JWT-protected route: automatically injects params[:current_user]
+api.get('/profile', auth: :jwt) do |params|
+  user = params[:current_user]
+  {
+    message: "Valid JWT token",
+    user_id: user[:user_id],
+    email: user[:email],
+    role: user[:role]
+  }
 end
-```
-
-```bash
-curl -H "Authorization: Bearer your_token" http://localhost:4567/api/v1/data
-```
-
-```json
-// 401 — missing header
-{ "error": "Token required. Format: 'Bearer <token>'" }
-
-// 403 — wrong token
-{ "error": "Invalid token" }
 ```
 
 ---
 
-## Parameter Validation
+## Multi-File Modular Architecture
+
+Divide your API into dedicated, clean route modules within a `routes/` directory:
+
+```text
+my_api_project/
+├── app.rb                   # Main entrypoint and configuration
+├── .env                     # Environment variables
+├── Gemfile
+└── routes/
+    ├── auth_routes.rb       # Login & registration
+    ├── admin_routes.rb      # Admin dashboard
+    ├── payments_routes.rb   # Checkout & billing
+    └── files_routes.rb      # File uploads & storage
+```
+
+### Module 1: `routes/auth_routes.rb`
+```ruby
+module AuthRoutes
+  def self.setup(router, api_server)
+    router.post('/login', auth: false, requires: { email: :email, password: String }) do |params|
+      if params[:email] == "admin@company.com" && params[:password] == "secret"
+        token = api_server.jwt_encode({ user_id: 1, email: params[:email], role: "admin" })
+        { token: token }
+      else
+        status 401
+        { error: "Invalid credentials" }
+      end
+    end
+  end
+end
+```
+
+### Module 2: `routes/admin_routes.rb`
+```ruby
+module AdminRoutes
+  def self.setup(router)
+    router.get('/metrics') do |params|
+      { cpu: "12%", memory: "380MB", user: params[:current_user][:email] }
+    end
+
+    router.delete('/users/:id') do |params|
+      { message: "User #{params[:id]} deleted" }
+    end
+  end
+end
+```
+
+### Module 3: `routes/files_routes.rb`
+```ruby
+module FilesRoutes
+  def self.setup(router)
+    router.post('/upload', requires: [:title]) do |params|
+      file = params[:_files][:document]
+      path = file.save_to("./storage/#{params[:title]}#{file.extension}")
+      { status: "saved", path: path, size: file.size }
+    end
+  end
+end
+```
+
+### Main Application File: `app.rb`
+```ruby
+require 'gr_api_manager'
+
+# Require modular route files
+require_relative 'routes/auth_routes'
+require_relative 'routes/admin_routes'
+require_relative 'routes/files_routes'
+
+api = GRApiManager::Server.new(
+  port: 4000,
+  jwt_secret: ENV['JWT_SECRET'] || "default_jwt_secret",
+  bearer_token: ENV['API_TOKEN'] || "global_static_token"
+)
+
+# Root route
+api.get('/', auth: false) { { service: "Core API v1.0" } }
+
+# Mount route groups
+api.group('/auth') { |g| AuthRoutes.setup(g, api) }
+api.group('/admin', auth: :jwt) { |g| AdminRoutes.setup(g) }
+api.group('/files', auth: true) { |g| FilesRoutes.setup(g) }
+
+api.run!(workers: 2, threads: '2:8')
+```
+
+---
+
+## Full REST CRUD with HTTP Verbs
+
+Example managing a `/products` resource:
 
 ```ruby
-api.post('/users', requires: [:name, :email, :role]) do |params|
+api = GRApiManager::Server.new(prefix: '/api/v1')
+
+# 1. LIST (GET) - with auto-cast query parameters
+api.get('/products', auth: false) do |params|
+  page   = params[:page] || 1        # Integer
+  limit  = params[:limit] || 10      # Integer
+  active = params[:active] != false  # Boolean
+  
+  {
+    page: page,
+    limit: limit,
+    items: [
+      { id: 1, name: "Mechanical Keyboard", price: 89.99, active: true },
+      { id: 2, name: "4K Monitor", price: 299.99, active: true }
+    ]
+  }
+end
+
+# 2. GET BY ID (GET)
+api.get('/products/:id', auth: false) do |params|
+  id = params[:id] # Auto Integer
+  { id: id, name: "Product #{id}", price: 49.99 }
+end
+
+# 3. CREATE (POST) - with strong type validation
+api.post('/products', requires: { name: String, price: Float, category: ['tech', 'office'] }) do |params|
   status 201
-  { message: "User created", user: params }
+  {
+    message: "Product created",
+    product: { id: rand(100..999), name: params[:name], price: params[:price] }
+  }
 end
-```
 
-```bash
-curl -X POST http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer secret" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Gabo"}'
+# 4. FULL UPDATE (PUT)
+api.put('/products/:id', requires: { name: String, price: Float }) do |params|
+  {
+    message: "Product #{params[:id]} completely updated",
+    data: params
+  }
+end
 
-# => 400 { "error": "Missing required parameters", "required": ["email", "role"] }
+# 5. PARTIAL UPDATE (PATCH)
+api.patch('/products/:id') do |params|
+  {
+    message: "Updated fields for product #{params[:id]}",
+    changes: params.except(:id)
+  }
+end
+
+# 6. DELETE (DELETE)
+api.delete('/products/:id') do |params|
+  { message: "Product #{params[:id]} deleted successfully" }
+end
 ```
 
 ---
 
-## Smart Type Casting
+## Declarative Schema & Type Validation
 
-Query string values are cast to native Ruby types before reaching your block:
+The `requires:` option validates data types, string formats, uploaded files, and custom logic:
 
-| String | Ruby type | Value |
+```ruby
+api.post '/catalog', requires: {
+  sku:         /^[A-Z]{3}-\d{4}$/,           # Regexp: e.g. "PRO-1234"
+  title:       String,                       # Non-empty string
+  price:       Float,                        # Float number
+  stock:       Integer,                      # Integer
+  active:      :boolean,                     # true or false
+  category:    ['electronics', 'home'],      # Enum / List of allowed values
+  photo:       :file,                        # Uploaded FilePayload
+  website:     :url,                         # Valid URL (http/https)
+  contact:     :email,                       # Valid email address
+  discount:    ->(v) { v.to_f.between?(0, 100) } # Custom Lambda validation
+} do |params|
+  status 201
+  { status: "ok", item: params[:title] }
+end
+```
+
+### Supported Validation Rules:
+
+| Rule | Expected Format / Type | Valid Example |
 |---|---|---|
-| `"42"` | Integer | `42` |
-| `"3.14"` | Float | `3.14` |
-| `"true"` | TrueClass | `true` |
-| `"false"` | FalseClass | `false` |
+| `:email` | Standard email format | `"contact@domain.com"` |
+| `:url` | URL with `http://` or `https://` | `"https://api.domain.com"` |
+| `:boolean` | Native boolean (`true` or `false`) | `true`, `false` |
+| `:file` | Instance of `GRApiManager::FilePayload` | Multipart file upload |
+| `Integer` | Integer number | `42`, `100`, `-10` |
+| `Float` | Floating point number | `19.99`, `0.5`, `-3.14` |
+| `Numeric` | Any numeric value (`Integer` or `Float`) | `10`, `3.14` |
+| `String` | Non-empty string | `"Sample Text"` |
+| `Array` | Array of elements | `[1, 2, 3]` |
+| `Hash` | JSON Object or Hash | `{ key: "value" }` |
+| `['a', 'b']` | Exact inclusion in list (Enum) | `'electronics'` |
+| `/^regex$/` | Regular expression match | `"ABC-1234"` |
+| `->(val) { ... }` | Custom Lambda/Proc (must return `true`) | `->(n) { n.to_i > 0 }` |
 
+---
+
+## Comprehensive File, Binary & Image Handling
+
+`gr_api_manager` detects incoming `Content-Type` headers and provides uniform file handling via `FilePayload`:
+
+### 1. Multipart Form Upload (`multipart/form-data`)
+```ruby
+api.post('/profile/avatar', requires: [:user_id]) do |params|
+  avatar = params[:_files][:avatar] # FilePayload instance
+
+  # Save to disk (creates directories automatically if missing)
+  saved_path = avatar.save_to("./storage/avatars/user_#{params[:user_id]}#{avatar.extension}")
+
+  {
+    message: "Avatar saved",
+    filename: avatar.filename,
+    size: avatar.size,
+    extension: avatar.extension,
+    saved_path: saved_path
+  }
+end
+```
+
+#### cURL multipart:
 ```bash
-curl "http://localhost:4567/api/v1/products?page=2&active=true&price=9.99"
-# params => { page: 2, active: true, price: 9.99 }
+curl -X POST http://localhost:4000/profile/avatar \
+  -H "Authorization: Bearer my_token" \
+  -F "user_id=10" \
+  -F "avatar=@/path/to/my_photo.jpg"
 ```
 
 ---
 
-## File & Binary Body Handling
+### 2. Raw Binary Upload (Image / PDF / Octet-Stream)
 
-The framework auto-detects `Content-Type` and parses accordingly. **No extra setup needed.**
-
-### Supported body formats
-
-| Content-Type | What you get in `params` |
-|---|---|
-| `application/json` | Regular symbolized hash |
-| `multipart/form-data` | Text fields + `:_files` → `{ field: FilePayload }` |
-| `image/*`, `video/*`, `audio/*` | `:_raw_binary` → `FilePayload` |
-| `application/pdf`, `application/msword`, `application/vnd.*` | `:_raw_binary` → `FilePayload` |
-| `application/octet-stream` | `:_raw_binary` → `FilePayload` |
-| `text/plain` | `:_raw_text` → `String` |
-
-### `FilePayload` API
-
-| Method | Returns | Description |
-|---|---|---|
-| `#read` | `String` (binary) | Raw bytes |
-| `#to_base64` | `String` | Base64-encoded (no newlines) |
-| `#to_hex` | `String` | Lowercase hexadecimal string |
-| `#save_to(path)` | `String` | Save to disk, returns path |
-| `#filename` | `String` | Original filename |
-| `#content_type` | `String` | MIME type |
-| `#size` | `Integer` | Size in bytes |
-| `#extension` | `String` | Extension (`.jpg`, `.pdf`, etc.) |
-| `#to_h` | `Hash` | JSON-safe summary |
-
-### Multipart image upload
+Direct raw byte streaming in request body (no multipart form):
 
 ```ruby
-api.post('/upload/avatar', auth: true) do |params|
-  file = params[:_files][:avatar]
-  halt 400, { error: 'Field "avatar" required' }.to_json unless file
-  halt 400, { error: "Invalid type" }.to_json unless %w[.jpg .png .webp].include?(file.extension)
+api.post('/documents/raw') do |params|
+  file = params[:_raw_binary] # FilePayload instance
 
-  file.save_to("/uploads/#{file.filename}")
-  status 201
-  { message: "Uploaded", file: file.to_h }
+  file.save_to("./storage/docs/#{file.filename}")
+  
+  {
+    format: "raw binary",
+    detected_filename: file.filename,
+    size_bytes: file.size,
+    mime_type: file.content_type,
+    initial_hex: file.to_hex[0..30]
+  }
 end
 ```
 
+#### cURL raw binary:
 ```bash
-curl -X POST http://localhost:4567/api/v1/upload/avatar \
-  -H "Authorization: Bearer secret" \
-  -F "avatar=@photo.jpg"
-```
-
-### Multiple files in one request
-
-```ruby
-api.post('/documents', auth: true) do |params|
-  files = params[:_files] || {}
-  halt 400, { error: 'No files received' }.to_json if files.empty?
-
-  saved = files.map { |_, f| f.save_to("/uploads/#{f.filename}"); f.to_h }
-  status 201
-  { uploaded: saved }
-end
-```
-
-```bash
-curl -X POST http://localhost:4567/api/v1/documents \
-  -H "Authorization: Bearer secret" \
-  -F "doc=@report.pdf" -F "thumbnail=@thumb.png"
-```
-
-### Raw binary body (image, PDF, Word, etc.)
-
-```ruby
-api.post('/files/raw', auth: true) do |params|
-  file = params[:_raw_binary]
-  halt 400, { error: 'Binary body required' }.to_json unless file
-
-  path = file.save_to("/uploads/#{file.filename}")
-  { saved_to: path, magic_bytes: file.to_hex[0, 8], size: file.size }
-end
-```
-
-```bash
-curl -X POST http://localhost:4567/api/v1/files/raw \
-  -H "Authorization: Bearer secret" \
-  -H "Content-Type: image/png" --data-binary @photo.png
-
-curl -X POST http://localhost:4567/api/v1/files/raw \
-  -H "Authorization: Bearer secret" \
-  -H "Content-Type: application/pdf" --data-binary @doc.pdf
-```
-
-### Base64 inside JSON
-
-```ruby
-require 'base64'
-
-api.post('/files/base64', auth: true, requires: [:data, :filename]) do |params|
-  raw  = Base64.strict_decode64(params[:data])
-  File.open("/uploads/#{params[:filename]}", 'wb') { |f| f.write(raw) }
-  { message: "Saved", bytes: raw.bytesize }
-end
-```
-
-```bash
-BASE64=$(base64 -w0 photo.jpg)
-curl -X POST http://localhost:4567/api/v1/files/base64 \
-  -H "Authorization: Bearer secret" \
-  -H "Content-Type: application/json" \
-  -d "{\"filename\":\"photo.jpg\",\"data\":\"$BASE64\"}"
-```
-
-### Hexadecimal
-
-```ruby
-api.post('/files/tohex', auth: true) do |params|
-  file = params[:_raw_binary]
-  halt 400, { error: 'Binary body required' }.to_json unless file
-  # to_hex converts any binary to a lowercase hex string
-  { hex: file.to_hex, bytes: file.size }
-end
-```
-
-### Plain text body
-
-```ruby
-api.post('/notes', auth: true) do |params|
-  text = params[:_raw_text]
-  halt 400, { error: 'Empty body' }.to_json if text.nil? || text.strip.empty?
-  { received: text, words: text.split.size }
-end
-```
-
-### Serving a file as binary response
-
-```ruby
-api.get('/files/:name', auth: true) do |params|
-  path = "/uploads/#{File.basename(params[:name].to_s)}"
-  halt 404, { error: "Not found" }.to_json unless File.exist?(path)
-
-  content_type 'application/octet-stream'
-  response.headers['Content-Disposition'] = "attachment; filename=\"#{File.basename(path)}\""
-  File.binread(path)   # String → sent as-is, no JSON wrapping
-end
-```
-
-### Body size limit
-
-```json
-// When exceeded → 413
-{ "error": "Payload too large", "max_bytes": 52428800 }
-```
-
-```ruby
-GRApiManager::Server.new(max_body_size: GRApiManager.mb(200))  # 200 MB
-GRApiManager::Server.new(max_body_size: GRApiManager.gb(2))    # 2 GB
-GRApiManager::Server.new(max_body_size: GRApiManager.mb(1))    # 1 MB
+curl -X POST http://localhost:4000/documents/raw \
+  -H "Authorization: Bearer my_token" \
+  -H "Content-Type: application/pdf" \
+  -H "Content-Disposition: attachment; filename=\"contract.pdf\"" \
+  --data-binary @contract.pdf
 ```
 
 ---
 
-## Dev Mode
+### 3. Base64 and Hexadecimal Conversion
+```ruby
+api.post('/files/convert') do |params|
+  file = params[:_files][:file]
 
-Enable during development for full stack traces on `500` errors:
+  {
+    base64: file.to_base64, # Clean Base64 string without newlines
+    hexadecimal: file.to_hex, # Lowercase hex string
+    total_bytes: file.size
+  }
+end
+```
+
+---
+
+### 4. Plain Text Upload (`text/plain`)
+```ruby
+api.post('/logs/text') do |params|
+  raw_text = params[:_raw_text] # UTF-8 String
+  { lines: raw_text.lines.count, characters: raw_text.length }
+end
+```
+
+---
+
+## Serving & Downloading Files to Clients
+
+When a route block returns a `String`, `gr_api_manager` serves it **directly as raw data**, allowing seamless downloads of images, PDFs, or binary streams:
+
+```ruby
+api.get('/downloads/photo/:id', auth: false) do |params|
+  photo_path = "./storage/avatars/user_#{params[:id]}.jpg"
+  
+  unless File.exist?(photo_path)
+    status 404
+    next { error: "Photo not found" }
+  end
+
+  # Configure response headers
+  content_type 'image/jpeg'
+  headers 'Content-Disposition' => "inline; filename=\"photo_#{params[:id]}.jpg\""
+  
+  # Return binary bytes directly
+  File.binread(photo_path)
+end
+```
+
+---
+
+## Rate Limiting & Real IP Detection
+
+Protect your API with thread-safe sliding-window rate limiting per client IP:
 
 ```ruby
 api = GRApiManager::Server.new(
-  bearer_token: "secret",
-  dev_mode: true   # ⚠️ Disable in production
+  rate_limit:          60,   # Max 60 requests
+  rate_limit_window:   60,   # per 60-second window
+  trust_proxy_headers: true  # Reads CF-Connecting-IP, X-Real-IP, X-Forwarded-For
 )
 ```
 
-**Production (dev_mode: false):**
-```json
-{ "error": "Internal Server Error", "details": "undefined method 'foo' for nil" }
+Standard HTTP response headers:
+* `X-RateLimit-Limit`: Maximum allowed requests (`60`).
+* `X-RateLimit-Remaining`: Remaining requests in current window.
+* `X-RateLimit-Reset`: Unix timestamp when quota resets.
+* `Retry-After`: Seconds to wait if rate-limited (`429 Too Many Requests`).
+
+---
+
+## Smart Parameter Casting
+
+URL and Query String parameters are automatically converted to native Ruby types before entering your route block:
+
+```ruby
+api.get('/analytics') do |params|
+  # Request: /analytics?id=123&active=true&discount=15.5&balance=-500&category=tech
+  
+  params[:id]        # => 123 (Integer)
+  params[:active]    # => true (TrueClass)
+  params[:discount] # => 15.5 (Float)
+  params[:balance]   # => -500 (Integer)
+  params[:category]  # => "tech" (String)
+  
+  { status: "ok" }
+end
 ```
 
-**Development (dev_mode: true):**
+---
+
+## Responses, HTTP Status Codes & Dev Mode
+
+### Custom status codes:
+```ruby
+api.post('/resources') do
+  status 201 # Created
+  { message: "Resource created" }
+end
+```
+
+### Developer Mode (`dev_mode: true`):
+Enable `dev_mode: true` to receive structured JSON error payloads with full stack traces during development:
+
+```ruby
+api = GRApiManager::Server.new(dev_mode: true)
+```
+
+Error response on 500:
 ```json
 {
   "error": "Internal Server Error",
-  "details": "undefined method 'foo' for nil",
-  "class": "NoMethodError",
-  "backtrace": ["app.rb:42:in 'block in register_route'", "..."]
-}
-```
-
----
-
-## Error Handling
-
-```json
-// 404
-{ "error": "Endpoint not found", "path": "/api/v1/missing" }
-
-// 500
-{ "error": "Internal Server Error", "details": "..." }
-
-// 413
-{ "error": "Payload too large", "max_bytes": 52428800 }
-```
-
----
-
-## Request Logging
-
-```text
-[14:32:01] GET  /api/v1/health - 200
-[14:32:05] POST /api/v1/users - 400
-[14:32:10] POST /api/v1/upload/avatar - 201
-```
-
-Green for 2xx, red for everything else.
-
----
-
-## Running the Server
-
-```text
-=============================================
-  GR API MANAGER STARTED
-  Port      : 4567
-  Auth      : Enabled
-  Prefix    : /api/v1
-  Max Body  : 50.0 MB
-  Dev Mode  : Off
-=============================================
-```
-
----
-
-## Complete Example — Country API
-
-This shows how the framework handles a real-world CRUD API with file uploads. Note that the server is named `pais_api` — **you can name it anything**.
-
-```ruby
-require 'gr_api_manager'
-require 'fileutils'
-
-FileUtils.mkdir_p('/uploads/flags')
-
-pais_api = GRApiManager::Server.new(
-  port:          4567,
-  bearer_token:  "geo_secret_2024",
-  prefix:        "/geo/v1",
-  max_body_size: GRApiManager.mb(5),
-  dev_mode:      true
-)
-
-COUNTRIES = [
-  { id: 1, name: "Mexico",    capital: "Mexico City",  pop: 128_000_000, continent: "North America" },
-  { id: 2, name: "Argentina", capital: "Buenos Aires", pop: 45_000_000,  continent: "South America" },
-  { id: 3, name: "Spain",     capital: "Madrid",       pop: 47_000_000,  continent: "Europe" }
-]
-
-# GET — list all (public)
-pais_api.get('/countries', auth: false) do
-  { total: COUNTRIES.size, countries: COUNTRIES }
-end
-
-# GET — single country (:id cast to Integer automatically)
-pais_api.get('/countries/:id', auth: false) do |params|
-  c = COUNTRIES.find { |x| x[:id] == params[:id] }
-  status 404 and next { error: "Not found" } unless c
-  c
-end
-
-# GET — search by name
-pais_api.get('/countries/search', auth: false, requires: [:name]) do |params|
-  results = COUNTRIES.select { |c| c[:name].downcase.include?(params[:name].downcase) }
-  { total: results.size, countries: results }
-end
-
-# POST — create (protected)
-pais_api.post('/countries', auth: true, requires: [:name, :capital, :pop]) do |params|
-  c = { id: COUNTRIES.size + 1, name: params[:name],
-        capital: params[:capital], pop: params[:pop],
-        continent: params[:continent] || "Unknown" }
-  COUNTRIES << c
-  status 201
-  { message: "Country created", country: c }
-end
-
-# PUT — full replace (protected)
-pais_api.put('/countries/:id', auth: true, requires: [:name, :capital]) do |params|
-  c = COUNTRIES.find { |x| x[:id] == params[:id] }
-  status 404 and next { error: "Not found" } unless c
-  c[:name] = params[:name]; c[:capital] = params[:capital]
-  c[:pop]  = params[:pop] if params[:pop]
-  { message: "Updated", country: c }
-end
-
-# PATCH — partial update (protected)
-pais_api.patch('/countries/:id', auth: true) do |params|
-  c = COUNTRIES.find { |x| x[:id] == params[:id] }
-  status 404 and next { error: "Not found" } unless c
-  [:name, :capital, :pop, :continent].each { |k| c[k] = params[k] if params[k] }
-  { message: "Patched", country: c }
-end
-
-# DELETE (protected)
-pais_api.delete('/countries/:id', auth: true) do |params|
-  c = COUNTRIES.find { |x| x[:id] == params[:id] }
-  status 404 and next { error: "Not found" } unless c
-  COUNTRIES.delete(c)
-  { message: "Deleted", id: params[:id] }
-end
-
-# POST — upload flag (multipart, protected)
-pais_api.post('/countries/:id/flag', auth: true) do |params|
-  file = params[:_files]&.dig(:flag)
-  halt 400, { error: 'Field "flag" required' }.to_json unless file
-  halt 400, { error: "Format not allowed: #{file.extension}" }.to_json \
-    unless %w[.jpg .jpeg .png .svg .webp].include?(file.extension)
-
-  file.save_to("/uploads/flags/#{params[:id]}#{file.extension}")
-  status 201
-  { message: "Flag uploaded", file: file.to_h }
-end
-
-# GET — download flag (public, binary response)
-pais_api.get('/countries/:id/flag', auth: false) do |params|
-  f = Dir.glob("/uploads/flags/#{params[:id]}.*").first
-  halt 404, { error: "Flag not found" }.to_json unless f
-
-  content_type 'application/octet-stream'
-  response.headers['Content-Disposition'] = "attachment; filename=\"#{File.basename(f)}\""
-  File.binread(f)
-end
-
-pais_api.run!
-```
-
-```bash
-curl http://localhost:4567/geo/v1/countries
-curl http://localhost:4567/geo/v1/countries/1
-curl -X POST http://localhost:4567/geo/v1/countries \
-  -H "Authorization: Bearer geo_secret_2024" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Brazil","capital":"Brasilia","pop":215000000}'
-curl -X PATCH http://localhost:4567/geo/v1/countries/1 \
-  -H "Authorization: Bearer geo_secret_2024" \
-  -H "Content-Type: application/json" \
-  -d '{"pop":130000000}'
-curl -X POST http://localhost:4567/geo/v1/countries/1/flag \
-  -H "Authorization: Bearer geo_secret_2024" \
-  -F "flag=@mexico_flag.png"
-curl -X DELETE http://localhost:4567/geo/v1/countries/3 \
-  -H "Authorization: Bearer geo_secret_2024"
-```
-
----
-
-## High Traffic & Concurrency
-
-GR API Manager is built on **Puma** (the standard production Ruby server) and handles concurrent traffic out of the box. Here's how each layer works and what you can tune.
-
-### How it handles concurrency
-
-Puma uses a **multi-worker + multi-thread** model:
-- **Workers** = OS processes, each with its own memory. More workers = more CPU cores used.
-- **Threads** = lightweight concurrent handlers inside each worker. Threads share memory.
-
-```
-Request → Worker 1 → Thread A  →  route handler
-                   → Thread B  →  route handler
-                   → ...
-       → Worker 2 → Thread A  →  route handler
-                   → ...
-```
-
-A server with `workers: 4, threads: '2:8'` can handle up to **32 simultaneous requests** before queuing.
-
-### Configuring workers and threads
-
-Pass them directly to `run!`:
-
-```ruby
-api.run!(
-  workers: 4,     # Number of Puma worker processes
-  threads: '2:8'  # min_threads:max_threads per worker
-)
-```
-
-Or via environment variables (recommended for production):
-
-```bash
-WEB_CONCURRENCY=4 ruby app.rb
-```
-
-**Practical starting points:**
-
-| Scenario | Workers | Threads |
-|---|---|---|
-| Development / local | 1 | `1:4` |
-| Small server (1–2 CPU cores) | 2 | `2:8` |
-| Medium server (4 CPU cores) | 4 | `2:8` |
-| High-traffic (8+ CPU cores) | 8 | `4:16` |
-| I/O-heavy (DB, external APIs) | 2 | `8:32` |
-
-### Built-in rate limiting
-
-Protect your server from flooding and abusive clients with the built-in sliding-window rate limiter:
-
-```ruby
-api = GRApiManager::Server.new(
-  bearer_token:      "secret",
-  rate_limit:        100,   # max 100 requests per IP
-  rate_limit_window: 60     # per 60-second window
-)
-```
-
-When a client exceeds the limit, they receive `429 Too Many Requests`:
-
-```json
-{ "error": "Too many requests", "retry_after_seconds": 60 }
-```
-
-Response headers are automatically added to every request:
-
-```
-X-RateLimit-Limit:     100
-X-RateLimit-Remaining: 47
-Retry-After:           60   (only on 429 responses)
-X-RateLimit-Reset:     1721620800
-```
-
-The limiter is **thread-safe** (uses a `Mutex`) and runs a background cleanup thread automatically to prevent memory growth from tracked IPs.
-
-**Common rate limit configs:**
-
-```ruby
-# Public API — moderate protection
-GRApiManager::Server.new(rate_limit: 200, rate_limit_window: 60)
-
-# Strict — auth endpoints, login, password reset
-GRApiManager::Server.new(rate_limit: 10, rate_limit_window: 60)
-
-# Generous — internal service behind a trusted proxy
-GRApiManager::Server.new(rate_limit: 2000, rate_limit_window: 60)
-```
-
-### Production architecture for truly massive traffic
-
-For thousands of concurrent users, add layers in front of the framework:
-
-```
-Internet
-   │
-   ▼
-[Nginx]          ← terminates SSL, serves static files, load balances
-   │
-   ├──▶ GR API Manager (worker 1, port 4567)
-   ├──▶ GR API Manager (worker 2, port 4568)
-   └──▶ GR API Manager (worker 3, port 4569)
-```
-
-**Minimal Nginx config for load balancing:**
-
-```nginx
-upstream gr_api {
-    server 127.0.0.1:4567;
-    server 127.0.0.1:4568;
-    server 127.0.0.1:4569;
-}
-
-server {
-    listen 80;
-    server_name api.yourdomain.com;
-
-    location / {
-        proxy_pass         http://gr_api;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-```
-
-### What the banner shows
-
-```text
-=============================================
-  GR API MANAGER STARTED
-  Port      : 4567
-  Auth      : Enabled
-  Prefix    : /api/v1
-  Max Body  : 50.0 MB
-  Workers   : 4  |  Threads: 2:8
-  Rate Limit: 100 req / 60s per IP
-  Dev Mode  : Off
-=============================================
-```
-
----
-
-## Multiple Route Groups on One Server
-
-
-You don't need to spin up separate servers for different API sections. Register all your route groups on **a single server instance** — one process, one port, zero extra resource cost.
-
-The cleanest pattern is to extract each group into its own file and pass the server object as an argument:
-
-```
-project/
-├── main.rb
-└── routes/
-    ├── users.rb
-    ├── countries.rb
-    └── products.rb
-```
-
-```ruby
-# routes/users.rb
-def register_users(api)
-  api.get('/users', auth: false) do
-    { users: [{ id: 1, name: "Alice" }, { id: 2, name: "Bob" }] }
-  end
-
-  api.post('/users', auth: true, requires: [:name, :email]) do |params|
-    status 201
-    { message: "User created", user: { name: params[:name], email: params[:email] } }
-  end
-
-  api.delete('/users/:id', auth: true) do |params|
-    { message: "User #{params[:id]} deleted" }
-  end
-end
-```
-
-```ruby
-# routes/countries.rb
-def register_countries(api)
-  COUNTRIES = [
-    { id: 1, name: "Mexico", capital: "Mexico City" },
-    { id: 2, name: "Spain",  capital: "Madrid" }
+  "details": "undefined local variable or method 'missing_var'",
+  "class": "NameError",
+  "backtrace": [
+    "/app/routes/users.rb:14:in `block in setup'",
+    "/lib/gr_api_manager.rb:482:in `instance_exec'"
   ]
-
-  api.get('/countries', auth: false) do
-    { total: COUNTRIES.size, countries: COUNTRIES }
-  end
-
-  api.get('/countries/:id', auth: false) do |params|
-    c = COUNTRIES.find { |x| x[:id] == params[:id] }
-    status 404 and next { error: "Not found" } unless c
-    c
-  end
-end
+}
 ```
 
+---
+
+## Concurrency & Production Deployment
+
+### Running with Puma in Production:
 ```ruby
-# routes/products.rb
-def register_products(api)
-  api.get('/products', auth: false) do
-    { products: [{ id: 1, name: "Laptop", price: 999.99 }] }
-  end
-
-  api.post('/products', auth: true, requires: [:name, :price]) do |params|
-    status 201
-    { message: "Product created", product: { name: params[:name], price: params[:price] } }
-  end
-end
+# Start with 4 worker processes and 4:16 threads per worker
+api.run!(workers: 4, threads: '4:16')
 ```
 
-```ruby
-# main.rb — one server, three route groups, one process
-require 'gr_api_manager'
-require_relative 'routes/users'
-require_relative 'routes/countries'
-require_relative 'routes/products'
+### Production `Dockerfile`:
+```dockerfile
+FROM ruby:3.3-slim
 
-api = GRApiManager::Server.new(
-  port:         4567,
-  bearer_token: "secret",
-  prefix:       "/api/v1"
-)
+WORKDIR /app
+COPY Gemfile* ./
+RUN bundle install --without development test
 
-register_users(api)       # mounts: GET/POST /api/v1/users, DELETE /api/v1/users/:id
-register_countries(api)   # mounts: GET /api/v1/countries, GET /api/v1/countries/:id
-register_products(api)    # mounts: GET/POST /api/v1/products
+COPY . .
 
-api.run!
-# All routes available on a single process at localhost:4567
+EXPOSE 4000
+CMD ["ruby", "app.rb"]
 ```
+
+---
+
+## Automated Testing
+
+Full test suite with **RSpec** and **Rack::Test**:
 
 ```bash
-# All three groups work on the same server
-curl http://localhost:4567/api/v1/users
-curl http://localhost:4567/api/v1/countries
-curl http://localhost:4567/api/v1/products
-
-curl -X POST http://localhost:4567/api/v1/users \
-  -H "Authorization: Bearer secret" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Carlos","email":"carlos@example.com"}'
+rspec
+# => 59 examples, 0 failures
 ```
-
-This approach scales cleanly — add new route groups without touching `main.rb` logic, and everything shares the same auth token, prefix, and body size limit.
 
 ---
 
 ## License
 
-Available as open source under the [MIT License](https://opensource.org/licenses/MIT).
+This project is licensed under the [MIT](LICENSE) License. Created by **Gabo Razo**.

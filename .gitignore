@@ -16,3 +16,13 @@ Thumbs.db
 *.swp
 *.swo
 gr_test_uploads/
+
+# RSpec & Testing
+.rspec
+.rspec_status
+spec/
+coverage/
+
+# Custom Agent Skills
+skills/
+.agents/

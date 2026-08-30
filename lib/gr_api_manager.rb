@@ -3,6 +3,8 @@ require 'json'
 require 'dotenv/load'
 require 'base64'
 require 'tempfile'
+require 'fileutils'
+require 'openssl'
 
 module GRApiManager
   # Convenience size helpers — use in max_body_size:
@@ -11,58 +13,283 @@ module GRApiManager
   def self.mb(n) = n * 1_024 * 1_024
   def self.gb(n) = n * 1_024 * 1_024 * 1_024
 
-  # ---------------------------------------------------------------------------
-  # RateLimiter — thread-safe sliding-window rate limiter per IP address.
-  #
-  # Prevents any single client from flooding the server. Uses a mutex-protected
-  # in-memory store with automatic cleanup to avoid unbounded memory growth.
-  # ---------------------------------------------------------------------------
-  class RateLimiter
-    attr_reader :max_requests, :window_seconds
+  # Extracts the client IP from proxy headers (Cloudflare, X-Real-IP, X-Forwarded-For),
+  # falling back to request.ip or REMOTE_ADDR.
+  def self.extract_client_ip(request)
+    env = request.respond_to?(:env) ? request.env : request
+    return (request.respond_to?(:ip) ? request.ip : '127.0.0.1') unless env.is_a?(Hash)
 
-    def initialize(max_requests:, window_seconds:)
-      @max    = max_requests
-      @window = window_seconds
-      @store  = Hash.new { |h, k| h[k] = [] }
-      @mutex  = Mutex.new
+    if env['HTTP_CF_CONNECTING_IP'] && !env['HTTP_CF_CONNECTING_IP'].to_s.strip.empty?
+      return env['HTTP_CF_CONNECTING_IP'].to_s.strip
     end
 
-    # Returns true if the request from *ip* is within the allowed rate.
-    # Increments the counter for that IP on each allowed request.
-    def allow?(ip)
-      @mutex.synchronize do
-        now    = Time.now.to_f
-        cutoff = now - @window
-        @store[ip].reject! { |t| t < cutoff }
-        return false if @store[ip].size >= @max
-        @store[ip] << now
+    if env['HTTP_X_REAL_IP'] && !env['HTTP_X_REAL_IP'].to_s.strip.empty?
+      return env['HTTP_X_REAL_IP'].to_s.strip
+    end
+
+    if env['HTTP_X_FORWARDED_FOR'] && !env['HTTP_X_FORWARDED_FOR'].to_s.strip.empty?
+      client = env['HTTP_X_FORWARDED_FOR'].to_s.split(',').first
+      return client.strip if client && !client.strip.empty?
+    end
+
+    request.respond_to?(:ip) ? request.ip : (env['REMOTE_ADDR'] || '127.0.0.1')
+  end
+
+  # ---------------------------------------------------------------------------
+  # JWT — Zero-dependency JSON Web Token encoder and decoder (HS256).
+  # ---------------------------------------------------------------------------
+  module JWT
+    class DecodeError < StandardError; end
+    class ExpiredSignature < DecodeError; end
+
+    def self.base64url_encode(str)
+      Base64.urlsafe_encode64(str, padding: false)
+    end
+
+    def self.base64url_decode(str)
+      padded = str + ('=' * ((4 - (str.length % 4)) % 4))
+      Base64.urlsafe_decode64(padded)
+    rescue ArgumentError => e
+      raise DecodeError, "Invalid Base64URL string: #{e.message}"
+    end
+
+    # Encodes a payload hash into a JWT token signed with HMAC-SHA256.
+    # Options:
+    #   exp: Integer – expiration timestamp (epoch in seconds).
+    def self.encode(payload, secret, exp: nil, algorithm: 'HS256')
+      raise ArgumentError, "JWT secret cannot be blank" if secret.to_s.strip.empty?
+
+      data = payload.dup
+      data = data.transform_keys(&:to_sym) if data.is_a?(Hash)
+      data[:exp] = exp.to_i if exp
+
+      header = { typ: 'JWT', alg: algorithm }
+      header_b64    = base64url_encode(header.to_json)
+      payload_b64   = base64url_encode(data.to_json)
+      signing_input = "#{header_b64}.#{payload_b64}"
+
+      digest        = OpenSSL::Digest.new('sha256')
+      signature     = OpenSSL::HMAC.digest(digest, secret.to_s, signing_input)
+      signature_b64 = base64url_encode(signature)
+
+      "#{signing_input}.#{signature_b64}"
+    end
+
+    # Decodes and verifies a JWT token. Returns the payload hash with symbolized keys.
+    def self.decode(token, secret)
+      raise ArgumentError, "JWT secret cannot be blank" if secret.to_s.strip.empty?
+      raise DecodeError, "Token cannot be blank" if token.nil? || token.to_s.strip.empty?
+
+      parts = token.to_s.split('.')
+      raise DecodeError, "Invalid JWT format. Expected 3 segments separated by dots." unless parts.size == 3
+
+      header_b64, payload_b64, signature_b64 = parts
+      signing_input = "#{header_b64}.#{payload_b64}"
+
+      digest       = OpenSSL::Digest.new('sha256')
+      expected_sig = OpenSSL::HMAC.digest(digest, secret.to_s, signing_input)
+      actual_sig   = base64url_decode(signature_b64)
+
+      is_valid = if OpenSSL.respond_to?(:secure_compare)
+                   OpenSSL.secure_compare(expected_sig, actual_sig)
+                 else
+                   expected_sig == actual_sig
+                 end
+
+      raise DecodeError, "Invalid JWT signature" unless is_valid
+
+      payload_json = base64url_decode(payload_b64)
+      payload      = JSON.parse(payload_json, symbolize_names: true)
+
+      if payload[:exp]
+        exp_time = payload[:exp].to_i
+        raise ExpiredSignature, "JWT signature has expired" if Time.now.to_i > exp_time
+      end
+
+      payload
+    rescue JSON::ParserError => e
+      raise DecodeError, "Invalid JSON payload in token: #{e.message}"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Validator — declarative schema and type validation.
+  # ---------------------------------------------------------------------------
+  module Validator
+    EMAIL_REGEX = /\A[^\s@]+@[^\s@]+\.[^\s@]+\z/
+    URL_REGEX   = /\Ahttps?:\/\/\S+\z/i
+
+    # Validates *params* against *schema* (Hash of field => expected_type).
+    # Returns [is_valid, errors_hash].
+    def self.validate(params, schema)
+      errors = {}
+
+      schema.each do |field, rule|
+        key = field.to_sym
+        val = params[key]
+
+        # Check presence
+        if val.nil? || (val.is_a?(String) && val.strip.empty?)
+          errors[key] = "is required"
+          next
+        end
+
+        # Validate type / contract rule
+        error_msg = validate_rule(val, rule)
+        errors[key] = error_msg if error_msg
+      end
+
+      [errors.empty?, errors]
+    end
+
+    private_class_method
+
+    def self.validate_rule(val, rule)
+      case rule
+      when :email
+        "must be a valid email address" unless val.to_s.match?(EMAIL_REGEX)
+      when :url
+        "must be a valid URL (http/https)" unless val.to_s.match?(URL_REGEX)
+      when :boolean
+        "must be a boolean (true or false)" unless val == true || val == false
+      when :file
+        "must be an uploaded file" unless val.is_a?(GRApiManager::FilePayload)
+      when Class
+        if rule == Integer
+          "must be an Integer" unless val.is_a?(Integer)
+        elsif rule == Float
+          "must be a Float" unless val.is_a?(Float)
+        elsif rule == Numeric
+          "must be a Numeric" unless val.is_a?(Numeric)
+        elsif rule == String
+          "must be a String" unless val.is_a?(String)
+        elsif rule == Hash
+          "must be an Object/Hash" unless val.is_a?(Hash)
+        elsif rule == Array
+          "must be an Array" unless val.is_a?(Array)
+        else
+          "must be a #{rule}" unless val.is_a?(rule)
+        end
+      when Array
+        "must be one of: #{rule.map(&:to_s).join(', ')}" unless rule.map(&:to_s).include?(val.to_s)
+      when Regexp
+        "does not match expected format" unless val.to_s.match?(rule)
+      when Proc
+        "is invalid" unless rule.call(val)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RateLimiter — thread-safe sliding-window rate limiter per IP/key.
+  #
+  # Supports pluggable storage backends (default: MemoryStore with Mutex).
+  # Prevents client flooding and supports distributed stores like Redis.
+  # ---------------------------------------------------------------------------
+  class RateLimiter
+    attr_reader :max_requests, :window_seconds, :store
+
+    # In-memory sliding-window store using Mutex.
+    class MemoryStore
+      def initialize
+        @store = Hash.new { |h, k| h[k] = [] }
+        @mutex = Mutex.new
+      end
+
+      def allow?(key, max, window)
+        @mutex.synchronize do
+          now    = Time.now.to_f
+          cutoff = now - window
+          @store[key].reject! { |t| t < cutoff }
+          return false if @store[key].size >= max
+          @store[key] << now
+          true
+        end
+      end
+
+      def remaining(key, max, window)
+        @mutex.synchronize do
+          cutoff = Time.now.to_f - window
+          active = @store[key].count { |t| t >= cutoff }
+          [max - active, 0].max
+        end
+      end
+
+      def cleanup!(window)
+        @mutex.synchronize do
+          cutoff = Time.now.to_f - window
+          @store.each_value { |times| times.reject! { |t| t < cutoff } }
+          @store.delete_if  { |_, times| times.empty? }
+        end
+      end
+
+      def reset!(key = nil)
+        @mutex.synchronize do
+          if key
+            @store.delete(key)
+          else
+            @store.clear
+          end
+        end
+      end
+
+      def size
+        @mutex.synchronize { @store.size }
+      end
+    end
+
+    def initialize(max_requests:, window_seconds:, store: nil)
+      @max_requests   = max_requests
+      @window_seconds = window_seconds
+      @store          = store || MemoryStore.new
+    end
+
+    # Returns true if the request from *key* is within the allowed rate.
+    def allow?(key)
+      if @store.respond_to?(:allow?)
+        if @store.method(:allow?).arity == 1
+          @store.allow?(key)
+        else
+          @store.allow?(key, @max_requests, @window_seconds)
+        end
+      else
         true
       end
     end
 
-    # Remaining requests allowed for *ip* in the current window.
-    def remaining(ip)
-      @mutex.synchronize do
-        cutoff = Time.now.to_f - @window
-        active = @store[ip].count { |t| t >= cutoff }
-        [@max - active, 0].max
+    # Remaining requests allowed for *key* in the current window.
+    def remaining(key)
+      if @store.respond_to?(:remaining)
+        if @store.method(:remaining).arity == 1
+          @store.remaining(key)
+        else
+          @store.remaining(key, @max_requests, @window_seconds)
+        end
+      else
+        @max_requests
       end
     end
 
     # Removes stale entries — call periodically to prevent memory growth.
     def cleanup!
-      @mutex.synchronize do
-        cutoff = Time.now.to_f - @window
-        @store.each_value { |times| times.reject! { |t| t < cutoff } }
-        @store.delete_if  { |_, times| times.empty? }
+      if @store.respond_to?(:cleanup!)
+        if @store.method(:cleanup!).arity == 0
+          @store.cleanup!
+        else
+          @store.cleanup!(@window_seconds)
+        end
       end
+    end
+
+    # Resets counters for a specific key or all keys.
+    def reset!(key = nil)
+      @store.reset!(key) if @store.respond_to?(:reset!)
     end
 
     # Summary hash — safe to log or expose on a diagnostic endpoint.
     def stats
-      @mutex.synchronize do
-        { tracked_ips: @store.size, max_requests: @max, window_seconds: @window }
-      end
+      tracked = @store.respond_to?(:size) ? @store.size : :external
+      { tracked_ips: tracked, max_requests: @max_requests, window_seconds: @window_seconds }
     end
   end
 
@@ -76,16 +303,16 @@ module GRApiManager
       @tempfile     = tempfile
       @filename     = filename.to_s
       @content_type = content_type.to_s
-      @size         = tempfile.respond_to?(:size) ? tempfile.size : tempfile.length
+      @size         = tempfile.respond_to?(:size) ? tempfile.size : (tempfile.respond_to?(:length) ? tempfile.length : tempfile.to_s.bytesize)
     end
 
     # Returns the raw binary content of the file as a String (encoding: BINARY).
     def read
       if @tempfile.respond_to?(:read)
-        @tempfile.rewind
+        @tempfile.rewind if @tempfile.respond_to?(:rewind)
         @tempfile.read
       else
-        @tempfile.to_s.force_encoding(Encoding::BINARY)
+        @tempfile.to_s.dup.force_encoding(Encoding::BINARY)
       end
     end
 
@@ -101,6 +328,8 @@ module GRApiManager
 
     # Saves the uploaded content to *dest_path* on disk. Returns dest_path.
     def save_to(dest_path)
+      dir = File.dirname(dest_path)
+      FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
       File.open(dest_path, 'wb') { |f| f.write(read) }
       dest_path
     end
@@ -128,14 +357,6 @@ module GRApiManager
 
   # ---------------------------------------------------------------------------
   # BodyParser — detects Content-Type and returns an appropriate parsed result.
-  #
-  # Supported formats:
-  #   application/json                 -> Hash (symbolized keys)
-  #   multipart/form-data              -> Hash + :_files key (FilePayload objects)
-  #   application/octet-stream         -> :_raw_binary (FilePayload)
-  #   image/*  / application/pdf etc.  -> :_raw_binary (FilePayload)
-  #   text/plain                       -> :_raw_text (String)
-  #   application/x-www-form-urlencoded-> Hash (Sinatra already handles this)
   # ---------------------------------------------------------------------------
   module BodyParser
 
@@ -146,12 +367,8 @@ module GRApiManager
     ].freeze
 
     # Returns a Hash of parsed body values.
-    # Special keys injected into the result hash:
-    #   :_files        => { field_name => FilePayload }  (multipart)
-    #   :_raw_binary   => FilePayload                    (raw binary body)
-    #   :_raw_text     => String                         (plain-text body)
     def self.parse(request)
-      content_type = (request.content_type || '').split(';').first.strip.downcase
+      content_type = (request.content_type || '').split(';').first.to_s.strip.downcase
 
       case content_type
       when 'application/json'
@@ -161,7 +378,6 @@ module GRApiManager
         parse_multipart(request)
 
       when 'application/x-www-form-urlencoded'
-        # Sinatra already exposes these in `params` — nothing extra to do.
         {}
 
       when 'text/plain'
@@ -169,17 +385,14 @@ module GRApiManager
         { _raw_text: text }
 
       else
-        # Treat anything else that looks binary as a raw binary upload.
         if binary_content_type?(content_type)
           parse_raw_binary(request, content_type)
         else
-          # Last resort: try JSON, silently fall back to empty hash.
           parse_json(request) rescue {}
         end
       end
     end
 
-    # -------------------------------------------------------------------------
     private_class_method
 
     def self.parse_json(request)
@@ -198,14 +411,12 @@ module GRApiManager
         sym = key.to_sym
 
         if value.is_a?(Hash) && value.key?(:tempfile)
-          # Rack multipart file upload hash
           files[sym] = FilePayload.new(
             tempfile:     value[:tempfile],
             filename:     value[:filename] || key,
             content_type: value[:type] || 'application/octet-stream'
           )
         elsif value.is_a?(Array)
-          # Multiple file inputs with the same name
           files[sym] = value.map do |v|
             if v.is_a?(Hash) && v.key?(:tempfile)
               FilePayload.new(
@@ -230,13 +441,10 @@ module GRApiManager
       raw = request.body.read
       return {} if raw.nil? || raw.empty?
 
-      # Try to derive a filename from the Content-Disposition header, if any.
       disposition = request.env['HTTP_CONTENT_DISPOSITION'] || ''
       filename    = disposition[/filename="?([^";]+)"?/, 1] || "upload#{ext_for(content_type)}"
 
-      # Wrap the raw bytes in a StringIO so FilePayload can rewind/read it.
       io = StringIO.new(raw.force_encoding(Encoding::BINARY))
-      io.define_singleton_method(:size) { raw.bytesize }
 
       payload = FilePayload.new(
         tempfile:     io,
@@ -251,7 +459,6 @@ module GRApiManager
       BINARY_MIME_PREFIXES.any? { |prefix| ct.start_with?(prefix) }
     end
 
-    # Maps common MIME types to file extensions for unnamed raw uploads.
     def self.ext_for(content_type)
       {
         'image/jpeg'          => '.jpg',
@@ -274,42 +481,104 @@ module GRApiManager
   end
 
   # ---------------------------------------------------------------------------
+  # RouteGroup — provides nested route grouping with shared prefixes and options.
+  # ---------------------------------------------------------------------------
+  class RouteGroup
+    attr_reader :server, :prefix, :options
+
+    def initialize(server, prefix = '', options = {})
+      @server  = server
+      @prefix  = prefix.to_s
+      @options = options
+    end
+
+    # Dynamically generate routing methods inside the group (get, post, put, patch, delete).
+    %w[get post put patch delete].each do |verb|
+      define_method(verb) do |path, route_options = {}, &block|
+        combined_path   = File.join('/', @prefix, path.to_s).gsub(%r{/+}, '/')
+        merged_options  = @options.merge(route_options)
+
+        if @options[:requires] && route_options[:requires]
+          merged_options[:requires] = merge_requires(@options[:requires], route_options[:requires])
+        end
+
+        @server.register_route(verb, combined_path, merged_options, &block)
+      end
+    end
+
+    # Nested sub-grouping.
+    def group(sub_prefix = '', sub_options = {}, &block)
+      combined_prefix = File.join('/', @prefix, sub_prefix.to_s).gsub(%r{/+}, '/')
+      merged_options  = @options.merge(sub_options)
+
+      if @options[:requires] && sub_options[:requires]
+        merged_options[:requires] = merge_requires(@options[:requires], sub_options[:requires])
+      end
+
+      sub_group = RouteGroup.new(@server, combined_prefix, merged_options)
+      block.call(sub_group) if block
+      sub_group
+    end
+
+    private
+
+    def merge_requires(req1, req2)
+      if req1.is_a?(Hash) && req2.is_a?(Hash)
+        req1.merge(req2)
+      elsif req1.is_a?(Array) && req2.is_a?(Array)
+        (req1 + req2).uniq
+      else
+        req2
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Server — the public-facing DSL.
   # ---------------------------------------------------------------------------
   class Server
-    attr_reader :app_class
+    attr_reader :app_class, :rate_limiter, :jwt_secret
 
     # Initializes the server configuration.
     #
     # Options:
-    #   port:               Integer  – listening port (default: ENV['PORT'] || 4000)
-    #   bearer_token:       String   – Bearer token for auth (default: ENV['API_TOKEN'])
-    #   permitted_hosts:    Array    – host allowlist; empty = allow all
-    #   prefix:             String   – route prefix, e.g. '/api/v1'
-    #   max_body_size:      Integer  – maximum accepted body in bytes (default: 50 MB)
-    #   dev_mode:           Boolean  – show full stack traces on 500 (default: false)
-    #   rate_limit:         Integer  – max requests per IP per window (nil = disabled)
-    #   rate_limit_window:  Integer  – sliding window in seconds (default: 60)
+    #   port:                 Integer  – listening port (default: ENV['PORT'] || 4000)
+    #   bearer_token:         String   – Bearer token for auth (default: ENV['API_TOKEN'])
+    #   jwt_secret:           String   – Secret key for signing/decoding JWTs (default: ENV['JWT_SECRET'])
+    #   permitted_hosts:      Array    – host allowlist; empty = allow all
+    #   prefix:               String   – route prefix, e.g. '/api/v1'
+    #   max_body_size:        Integer  – maximum accepted body in bytes (default: 50 MB)
+    #   dev_mode:             Boolean  – show full stack traces on 500 (default: false)
+    #   rate_limit:           Integer  – max requests per IP per window (nil = disabled)
+    #   rate_limit_window:    Integer  – sliding window in seconds (default: 60)
+    #   rate_limit_store:     Object   – custom store object (default: MemoryStore)
+    #   trust_proxy_headers:  Boolean  – inspect Cloudflare/X-Real-IP/X-Forwarded-For headers (default: true)
     def initialize(
       port: nil,
       bearer_token: nil,
+      jwt_secret: nil,
       permitted_hosts: [],
       prefix: '',
-      max_body_size:      GRApiManager.mb(50),
-      dev_mode:           false,
-      rate_limit:         nil,
-      rate_limit_window:  60
+      max_body_size:        GRApiManager.mb(50),
+      dev_mode:             false,
+      rate_limit:           nil,
+      rate_limit_window:    60,
+      rate_limit_store:     nil,
+      trust_proxy_headers:  true
     )
-      @port            = port || ENV['PORT'] || 4000
-      @token           = bearer_token || ENV['API_TOKEN']
-      @permitted_hosts = permitted_hosts.empty? ? [] : permitted_hosts
-      @prefix          = prefix
-      @max_body_size   = max_body_size
-      @dev_mode        = dev_mode
-      @rate_limiter    = rate_limit ? GRApiManager::RateLimiter.new(
-                           max_requests:   rate_limit,
-                           window_seconds: rate_limit_window
-                         ) : nil
+      @port                = port || ENV['PORT'] || 4000
+      @token               = bearer_token || ENV['API_TOKEN']
+      @jwt_secret          = jwt_secret || ENV['JWT_SECRET']
+      @permitted_hosts     = permitted_hosts.empty? ? [] : permitted_hosts
+      @prefix              = prefix
+      @max_body_size       = max_body_size
+      @dev_mode            = dev_mode
+      @trust_proxy_headers = trust_proxy_headers
+      @rate_limiter        = rate_limit ? GRApiManager::RateLimiter.new(
+                               max_requests:   rate_limit,
+                               window_seconds: rate_limit_window,
+                               store:          rate_limit_store
+                             ) : nil
 
       @app_class = Class.new(Sinatra::Base) do
 
@@ -320,15 +589,14 @@ module GRApiManager
         end
 
         # Casts string URL parameters to native Ruby types (Integer, Float, Boolean).
-        # Leaves values untouched if they are already non-String (e.g. FilePayload).
         def smart_parse(hash)
           hash.transform_values do |val|
             next val unless val.is_a?(String)
             case val
             when 'true'            then true
             when 'false'           then false
-            when /^\d+$/           then val.to_i
-            when /^\d+\.\d+$/      then val.to_f
+            when /^-?\d+$/         then val.to_i
+            when /^-?\d+\.\d+$/    then val.to_f
             else val
             end
           end
@@ -338,19 +606,42 @@ module GRApiManager
       configure_app
     end
 
+    # Encodes a payload into a JWT token using the configured jwt_secret.
+    def jwt_encode(payload, exp: nil)
+      raise "No jwt_secret configured for this server" unless @jwt_secret
+      GRApiManager::JWT.encode(payload, @jwt_secret, exp: exp)
+    end
+
+    # Decodes a JWT token using the configured jwt_secret.
+    def jwt_decode(token)
+      raise "No jwt_secret configured for this server" unless @jwt_secret
+      GRApiManager::JWT.decode(token, @jwt_secret)
+    end
+
+    # Groups routes under a common prefix with inherited options.
+    def group(prefix = '', options = {}, &block)
+      route_group = RouteGroup.new(self, prefix, options)
+      block.call(route_group) if block
+      route_group
+    end
+
     private
 
     # Sets up Sinatra environment, CORS policies, body size limit, rate limiting, and global error handlers.
     def configure_app
-      app           = @app_class
-      max_body      = @max_body_size
-      rate_limiter  = @rate_limiter
+      app                 = @app_class
+      max_body            = @max_body_size
+      rate_limiter        = @rate_limiter
+      trust_proxy_headers = @trust_proxy_headers
 
       app.set :port,               @port
       app.set :bind,               '0.0.0.0'
       app.set :token,              @token
+      app.set :jwt_secret,         @jwt_secret
       app.set :dev_mode,           @dev_mode
-      app.set :show_exceptions,    @dev_mode
+      app.set :show_exceptions,    false
+      app.set :raise_errors,       false
+      app.set :dump_errors,        false
       app.set :host_authorization, { permitted_hosts: @permitted_hosts }
       app.enable :static
 
@@ -361,8 +652,8 @@ module GRApiManager
 
         # Rate limiting — checked before anything else.
         if rate_limiter
-          ip = request.ip
-          unless rate_limiter.allow?(ip)
+          client_ip = trust_proxy_headers ? GRApiManager.extract_client_ip(request) : request.ip
+          unless rate_limiter.allow?(client_ip)
             remaining_reset = rate_limiter.window_seconds
             headers 'Retry-After'               => remaining_reset.to_s,
                     'X-RateLimit-Limit'         => rate_limiter.max_requests.to_s,
@@ -372,7 +663,7 @@ module GRApiManager
           end
           # Add rate-limit headers on allowed requests too.
           headers 'X-RateLimit-Limit'     => rate_limiter.max_requests.to_s,
-                  'X-RateLimit-Remaining' => rate_limiter.remaining(request.ip).to_s
+                  'X-RateLimit-Remaining' => rate_limiter.remaining(client_ip).to_s
         end
 
         # Body size limit (skip for read-only / headerless verbs).
@@ -392,17 +683,19 @@ module GRApiManager
 
       app.not_found do
         status 404
+        content_type :json
         { error: "Endpoint not found", path: request.path_info }.to_json
       end
 
       app.error do
         e = env['sinatra.error']
         status 500
+        content_type :json
         if settings.dev_mode
-          { error: "Internal Server Error", details: e.message,
-            class: e.class.to_s, backtrace: e.backtrace&.first(15) }.to_json
+          { error: "Internal Server Error", details: e&.message,
+            class: e&.class&.to_s, backtrace: e&.backtrace&.first(15) }.to_json
         else
-          { error: "Internal Server Error", details: e.message }.to_json
+          { error: "Internal Server Error", details: e&.message }.to_json
         end
       end
     end
@@ -417,37 +710,46 @@ module GRApiManager
     end
 
     # Core routing logic: auth validation, body parsing, param merging, validation, execution.
-    #
-    # Supported body formats (auto-detected via Content-Type):
-    #   application/json             – standard JSON body
-    #   multipart/form-data          – form fields + file uploads
-    #   application/octet-stream     – raw binary stream
-    #   image/*, video/*, audio/*    – raw binary media
-    #   application/pdf, etc.        – raw binary document
-    #   text/plain                   – plain text body
-    #
-    # Inside your block, params will contain:
-    #   :_files      => { field: FilePayload }   – for multipart uploads
-    #   :_raw_binary => FilePayload              – for raw binary/media bodies
-    #   :_raw_text   => String                   – for text/plain bodies
-    #
-    # Route options:
-    #   auth:     Boolean – require Bearer Token (default: true)
-    #   requires: Array   – required parameter keys [:name, :email, ...]
     def register_route(verb, path, options = {}, &block)
-      verb_up        = verb.to_s.upcase
-      require_auth   = options.fetch(:auth, true)
-      required_params = options.fetch(:requires, [])
+      verb_up         = verb.to_s.upcase
+      require_auth    = options.fetch(:auth, true)
+      required_params = options.fetch(:requires, nil)
 
       # Construct the full path with the optional prefix.
       full_path = File.join('/', @prefix.to_s, path.to_s).gsub(%r{/+}, '/')
 
       handler = proc do
         # 1. Authentication check
+        jwt_user = nil
         if require_auth
           auth_header = request.env["HTTP_AUTHORIZATION"]
           halt 401, { error: "Token required. Format: 'Bearer <token>'" }.to_json if auth_header.nil?
-          halt 403, { error: "Invalid token" }.to_json if auth_header.split(" ").last != settings.token
+
+          raw_token = auth_header.split(" ").last
+
+          if require_auth == :jwt || (require_auth == true && settings.jwt_secret && settings.token.nil?)
+            # JWT authentication mode
+            halt 500, { error: "Server error: jwt_secret is not configured" }.to_json unless settings.jwt_secret
+            begin
+              jwt_user = GRApiManager::JWT.decode(raw_token, settings.jwt_secret)
+            rescue GRApiManager::JWT::DecodeError => e
+              halt 401, { error: "Invalid token: #{e.message}" }.to_json
+            end
+          else
+            # Static Bearer Token mode
+            if raw_token != settings.token
+              # Fallback: if jwt_secret is set, try JWT decoding
+              if settings.jwt_secret
+                begin
+                  jwt_user = GRApiManager::JWT.decode(raw_token, settings.jwt_secret)
+                rescue GRApiManager::JWT::DecodeError
+                  halt 403, { error: "Invalid token" }.to_json
+                end
+              else
+                halt 403, { error: "Invalid token" }.to_json
+              end
+            end
+          end
         end
 
         # 2. Body parsing — smart detection based on Content-Type
@@ -461,29 +763,40 @@ module GRApiManager
         end
 
         # 3. Merge query/path parameters with parsed body.
-        #    URL params go through smart_parse; body values are left as-is
-        #    (so FilePayload objects, arrays, etc. are preserved).
         url_params  = smart_parse(params.reject { |_, v| v.is_a?(Hash) && v.key?(:tempfile) })
         all_params  = url_params.merge(parsed_body)
 
-        # 4. Declarative parameter validation (skips special _ keys and FilePayload values).
-        missing = required_params.select do |p|
-          val = all_params[p.to_sym]
-          val.nil? || (val.is_a?(String) && val.strip.empty?)
+        # Inyect JWT payload if authenticated via JWT
+        if jwt_user
+          all_params[:current_user] = jwt_user
+          all_params[:jwt_payload]  = jwt_user
         end
 
-        if missing.any?
-          status 400
-          log_request(verb_up, full_path, 400)
-          next { error: "Missing required parameters", required: missing }.to_json
+        # 4. Declarative parameter validation (Array of keys or Hash schema)
+        if required_params.is_a?(Hash)
+          is_valid, errors = GRApiManager::Validator.validate(all_params, required_params)
+          unless is_valid
+            status 400
+            log_request(verb_up, full_path, 400)
+            next { error: "Validation failed", errors: errors }.to_json
+          end
+        elsif required_params.is_a?(Array) && required_params.any?
+          missing = required_params.select do |p|
+            val = all_params[p.to_sym]
+            val.nil? || (val.is_a?(String) && val.strip.empty?)
+          end
+
+          if missing.any?
+            status 400
+            log_request(verb_up, full_path, 400)
+            next { error: "Missing required parameters", required: missing }.to_json
+          end
         end
 
         # 5. Execute user-defined block
         result = instance_exec(all_params, &block)
         log_request(verb_up, full_path, response.status)
 
-        # If the block returned a String (e.g. already rendered binary data),
-        # pass it through unchanged. Otherwise serialize to JSON.
         result.is_a?(String) ? result : result.to_json
       end
 
@@ -491,13 +804,6 @@ module GRApiManager
     end
 
     # Starts the Sinatra server.
-    #
-    # Options:
-    #   workers: Integer – Puma worker processes (default: ENV['WEB_CONCURRENCY'] || 2)
-    #   threads: String  – min:max thread count per worker (default: '2:8')
-    #
-    # For sustained high traffic, run behind Nginx as a reverse proxy.
-    # See the README section "High Traffic & Concurrency" for production tuning.
     def run!(workers: nil, threads: '2:8')
       w            = (workers || ENV.fetch('WEB_CONCURRENCY', 2)).to_i
       min_t, max_t = threads.to_s.split(':').map(&:to_i)
@@ -512,7 +818,7 @@ module GRApiManager
         max_threads: max_t
       }
 
-      # Background thread to purge stale rate-limit entries (prevents memory growth).
+      # Background thread to purge stale rate-limit entries.
       if @rate_limiter
         rl = @rate_limiter
         Thread.new do
@@ -529,10 +835,15 @@ module GRApiManager
                   'Disabled'
                 end
 
+      auth_info = []
+      auth_info << "Bearer Token" if @token
+      auth_info << "JWT (HS256)" if @jwt_secret
+      auth_display = auth_info.empty? ? "Public (no token)" : auth_info.join(' + ')
+
       puts "============================================="
       puts "  GR API MANAGER STARTED"
       puts "  Port      : #{@port}"
-      puts "  Auth      : #{@token ? 'Enabled' : 'Public (no token)'}"
+      puts "  Auth      : #{auth_display}"
       puts "  Prefix    : #{@prefix.empty? ? '/' : @prefix}"
       puts "  Max Body  : #{mb} MB"
       puts "  Workers   : #{w}  |  Threads: #{min_t}:#{max_t}"
